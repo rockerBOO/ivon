@@ -251,3 +251,37 @@ def test_ivon_hess_approx_methods():
     # Ensure invalid method raises ValueError
     with pytest.raises(ValueError):
         IVON(model.parameters(), lr=0.1, ess=20, hess_approx="invalid_method")
+
+
+def test_ivon_device_move():
+    """Test IVON optimizer when model is moved to different device after initialization"""
+    model = SimpleNet()
+
+    # Initialize optimizer on CPU
+    optimizer = IVON(model.parameters(), lr=0.1, ess=20, mc_samples=1)
+
+    # Move model to CUDA if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        model = model.to(device)
+
+        # This should work without device mismatch errors
+        with optimizer.sampled_params():
+            # Collect current parameter values
+            current_params = [p.clone() for p in model.parameters()]
+
+        # Test training step as well
+        X = torch.randn(10, 10).to(device)
+        y = torch.randint(0, 2, (10,)).to(device)
+        criterion = torch.nn.CrossEntropyLoss()
+
+        with optimizer.sampled_params(train=True):
+            optimizer.zero_grad()
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            loss.backward()
+
+        # This should also work
+        optimizer.step()
+    else:
+        pytest.skip("CUDA not available")

@@ -74,7 +74,7 @@ class IVON(torch.optim.Optimizer):
         self.mc_samples = mc_samples
         self.hess_approx = hess_approx
         self.sync = sync
-        self._numel, self._device, self._dtype = self._get_param_configs()
+        self._numel = self._get_param_configs()
         self.current_step = 0
         self.debias = debias
         self.rescale_lr = rescale_lr
@@ -85,28 +85,28 @@ class IVON(torch.optim.Optimizer):
         self._init_buffers()
 
     def _get_param_configs(self):
-        all_params = []
         for pg in self.param_groups:
             pg["numel"] = sum(p.numel() for p in pg["params"] if p is not None)
-            all_params += [p for p in pg["params"] if p is not None]
-        if len(all_params) == 0:
-            return 0, torch.device("cpu"), torch.get_default_dtype()
-        devices = {p.device for p in all_params}
-        if len(devices) > 1:
-            raise ValueError(
-                "Parameters are on different devices: "
-                f"{[str(d) for d in devices]}"
-            )
-        device = next(iter(devices))
-        dtypes = {p.dtype for p in all_params}
-        if len(dtypes) > 1:
-            raise ValueError(
-                "Parameters are on different dtypes: "
-                f"{[str(d) for d in dtypes]}"
-            )
-        dtype = next(iter(dtypes))
         total = sum(pg["numel"] for pg in self.param_groups)
-        return total, device, dtype
+        return total
+
+    @property
+    def _device(self):
+        """Get device from first parameter"""
+        for pg in self.param_groups:
+            for p in pg["params"]:
+                if p is not None:
+                    return p.device
+        return torch.device("cpu")
+    
+    @property
+    def _dtype(self):
+        """Get dtype from first parameter"""
+        for pg in self.param_groups:
+            for p in pg["params"]:
+                if p is not None:
+                    return p.dtype
+        return torch.get_default_dtype()
 
     def _reset_samples(self, reset_count=True):
         # Do not reset critical state unless explicitly told to do so
@@ -124,6 +124,14 @@ class IVON(torch.optim.Optimizer):
             group["hess"] = torch.zeros(
                 numel, device=self._device, dtype=self._dtype
             ).add(torch.as_tensor(hess_init))
+    
+    def _ensure_buffers_on_device(self):
+        """Ensure buffers are on the same device as parameters"""
+        for group in self.param_groups:
+            if "momentum" in group and group["momentum"].device != self._device:
+                group["momentum"] = group["momentum"].to(device=self._device, dtype=self._dtype)
+            if "hess" in group and group["hess"].device != self._device:
+                group["hess"] = group["hess"].to(device=self._device, dtype=self._dtype)
 
     @contextmanager
     def sampled_params(self, train: bool = False):
@@ -197,6 +205,9 @@ class IVON(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure: ClosureType = None) -> Optional[Tensor]:
+        # Ensure buffers are on correct device
+        self._ensure_buffers_on_device()
+        
         # Compute total number of parameters
         total_numel = sum(group['numel'] for group in self.param_groups)
         
@@ -249,6 +260,9 @@ class IVON(torch.optim.Optimizer):
         self.state["avg_nxg"].div_(world_size)
 
     def _sample_params(self) -> Tuple[Tensor, Tensor]:
+        # Ensure buffers are on correct device
+        self._ensure_buffers_on_device()
+        
         noise_samples = []
         param_avgs = []
 
