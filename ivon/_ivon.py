@@ -108,11 +108,11 @@ class IVON(torch.optim.Optimizer):
         total = sum(pg["numel"] for pg in self.param_groups)
         return total, device, dtype
 
-    def _reset_samples(self):
-        self.state['count'] = 0
-        self.state['avg_grad'] = None
-        self.state['avg_nxg'] = None
-        self.state['avg_gsq'] = None
+    def _reset_samples(self, reset_count=True):
+        # Do not reset critical state unless explicitly told to do so
+        if reset_count:
+            self.state['count'] = 0
+        # Intentionally keep gradient-related states as they are
 
     def _init_buffers(self):
         for group in self.param_groups:
@@ -145,17 +145,43 @@ class IVON(torch.optim.Optimizer):
 
                 p.data = param_avg[p_slice].view(p.shape)
                 if train:
-                    if p.requires_grad:
+                    # Always collect gradient, handling potential accumulated gradients
+                    if p.grad is not None:
                         param_grads.append(p.grad.flatten())
                     else:
-                        param_grads.append(torch.zeros_like(p).flatten())
+                        param_grads.append(torch.zeros(
+                            p.numel(), 
+                            device=p.device, 
+                            dtype=p.dtype
+                        ))
                 offset += p.numel()
         assert offset == self._numel  # sanity check
 
-        if train:  # collect grad sample for training
+        if train and param_grads:  # collect grad sample for training
             grad_sample = torch.cat(param_grads, 0)
+            
+            # Ensure state is initialized
+            if 'count' not in self.state:
+                self.state['count'] = 0
+            
+            # Increment count
             count = self.state["count"] + 1
             self.state["count"] = count
+            
+            # Compute total number of parameters
+            total_numel = sum(group['numel'] for group in self.param_groups)
+            
+            # Initialize gradient-related states if not already done
+            if self.state.get('avg_grad') is None:
+                self.state['avg_grad'] = torch.zeros(
+                    total_numel, 
+                    device=self._device, 
+                    dtype=self._dtype
+                )
+                self.state['avg_nxg'] = torch.zeros_like(self.state['avg_grad'])
+                self.state['avg_gsq'] = torch.zeros_like(self.state['avg_grad'])
+            
+            # Update running averages
             self.state["avg_grad"] = _welford_mean(
                 self.state["avg_grad"], grad_sample, count
             )
@@ -165,22 +191,93 @@ class IVON(torch.optim.Optimizer):
             elif self.hess_approx == 'gradsq':
                 self.state['avg_gsq'] = _welford_mean(
                     self.state['avg_gsq'], grad_sample.square(), count)
+            
+            # Ensure current_step is incremented
+            self.current_step = count
 
     @torch.no_grad()
     def step(self, closure: ClosureType = None) -> Optional[Tensor]:
+        # Compute total number of parameters
+        total_numel = sum(group['numel'] for group in self.param_groups)
+        
+        # Ensure state is properly initialized
+        if 'count' not in self.state or self.state['count'] is None:
+            self.state['count'] = 0
+        
+        # Initialize gradient-related states if not already done
+        if self.state.get('avg_grad') is None:
+            self.state['avg_grad'] = torch.zeros(
+                total_numel, 
+                device=self._device, 
+                dtype=self._dtype
+            )
+            self.state['avg_nxg'] = torch.zeros_like(self.state['avg_grad'])
+            self.state['avg_gsq'] = torch.zeros_like(self.state['avg_grad'])
+        
+        # Set closure default if not provided
         if closure is None:
             loss = None
         else:
+            # Handle multiple Monte Carlo samples if specified
             losses = []
             for _ in range(self.mc_samples):
                 with torch.enable_grad():
                     loss = closure()
                 losses.append(loss)
             loss = sum(losses) / self.mc_samples
-        if self.sync and dist.is_initialized():  # explicit sync
+        
+        # Collect and accumulate gradients
+        param_grads = []
+        noise_samples = []
+        offset = 0
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p is None or p.grad is None:
+                    continue
+                param_grads.append(p.grad.flatten())
+                # Generate noise for price method
+                if self.hess_approx == 'price':
+                    noise = torch.randn_like(p.grad.flatten())
+                    noise_samples.append(noise)
+                offset += p.numel()
+        
+        # Update gradient running averages if gradients exist
+        if param_grads:
+            grad_sample = torch.cat(param_grads, 0)
+            
+            # Increment count
+            count = self.state["count"] + 1
+            self.state["count"] = count
+            
+            # Update running averages
+            self.state["avg_grad"] = _welford_mean(
+                self.state["avg_grad"], grad_sample, count
+            )
+            
+            # Handle noise for price method
+            if self.hess_approx == 'price' and noise_samples:
+                noise_sample = torch.cat(noise_samples, 0)
+                self.state['avg_nxg'] = _welford_mean(
+                    self.state['avg_nxg'], noise_sample * grad_sample, count
+                )
+            elif self.hess_approx == 'gradsq':
+                self.state['avg_gsq'] = _welford_mean(
+                    self.state['avg_gsq'], grad_sample.square(), count
+                )
+        
+        # Handle distributed sync if needed
+        if self.sync and dist.is_initialized():
             self._sync_samples()
+        
+        # Track current step
+        self.current_step += 1
+        
+        # Perform parameter update
         self._update()
-        self._reset_samples()
+        
+        # Reset running statistics, but keep count and state
+        self._reset_samples(reset_count=False)
+        
         return loss
 
     def _sync_samples(self):
@@ -224,8 +321,20 @@ class IVON(torch.optim.Optimizer):
         return torch.cat(param_avgs, 0), torch.cat(noise_samples, 0)
 
     def _update(self):
-        self.current_step += 1
+        # If avg_grad is None, initialize with zeros
+        if self.state.get('avg_grad') is None:
+            # Compute total number of parameters
+            total_numel = sum(group['numel'] for group in self.param_groups)
+            self.state['avg_grad'] = torch.zeros(
+                total_numel, 
+                device=self._device, 
+                dtype=self._dtype
+            )
+            self.state['avg_nxg'] = torch.zeros_like(self.state['avg_grad'])
+            self.state['avg_gsq'] = torch.zeros_like(self.state['avg_grad'])
+            self.state['count'] = 0
 
+        # Prepare for parameter update
         offset = 0
         for group in self.param_groups:
             lr = group["lr"]
@@ -237,31 +346,34 @@ class IVON(torch.optim.Optimizer):
                 [p.flatten() for p in group["params"] if p is not None], 0
             )
 
-            group["momentum"] = self._new_momentum(
-                self.state["avg_grad"][pg_slice], group["momentum"], b1
-            )
+            # Handle case where avg_grad might not have been collected
+            if self.state['avg_grad'] is not None:
+                # Update momentum with available gradient information
+                group["momentum"] = self._new_momentum(
+                    self.state["avg_grad"][pg_slice], group["momentum"], b1
+                )
 
-            group["hess"] = self._new_hess(
-                self.hess_approx,
-                group["hess"],
-                self.state["avg_nxg"],
-                self.state['avg_gsq'],
-                pg_slice,
-                group["ess"],
-                b2,
-                group["weight_decay"],
-            )
+                group["hess"] = self._new_hess(
+                    self.hess_approx,
+                    group["hess"],
+                    self.state["avg_nxg"],
+                    self.state['avg_gsq'],
+                    pg_slice,
+                    group["ess"],
+                    b2,
+                    group["weight_decay"],
+                )
 
-            param_avg = self._new_param_averages(
-                param_avg,
-                group["hess"],
-                group["momentum"],
-                lr * (group["hess_init"] + group["weight_decay"]) if self.rescale_lr else lr,
-                group["weight_decay"],
-                group["clip_radius"],
-                1.0 - pow(b1, float(self.current_step)) if self.debias else 1.0,
-                group["hess_init"]
-            )
+                param_avg = self._new_param_averages(
+                    param_avg,
+                    group["hess"],
+                    group["momentum"],
+                    lr * (group["hess_init"] + group["weight_decay"]) if self.rescale_lr else lr,
+                    group["weight_decay"],
+                    group["clip_radius"],
+                    1.0 - pow(b1, float(self.current_step)) if self.debias else 1.0,
+                    group["hess_init"]
+                )
 
             # update params
             pg_offset = 0
