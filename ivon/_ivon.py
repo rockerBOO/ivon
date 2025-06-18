@@ -11,7 +11,15 @@ ClosureType = Callable[[], Tensor]
 
 
 def _welford_mean(avg: Optional[Tensor], newval: Tensor, count: int) -> Tensor:
-    return newval if avg is None else avg + (newval - avg) / count
+    # Use autocast for numerical stability during arithmetic operations
+    with torch.autocast(device_type=newval.device.type):
+        if avg is None:
+            return newval
+        else:
+            # Ensure consistent dtype
+            if avg.dtype != newval.dtype:
+                newval = newval.to(dtype=avg.dtype)
+            return avg + (newval - avg) / count
 
 
 class IVON(torch.optim.Optimizer):
@@ -118,20 +126,22 @@ class IVON(torch.optim.Optimizer):
         for group in self.param_groups:
             hess_init, numel = group["hess_init"], group["numel"]
 
+            # Always use float32 for internal optimizer buffers for numerical stability
             group["momentum"] = torch.zeros(
-                numel, device=self._device, dtype=self._dtype
+                numel, device=self._device, dtype=torch.float32
             )
             group["hess"] = torch.zeros(
-                numel, device=self._device, dtype=self._dtype
+                numel, device=self._device, dtype=torch.float32
             ).add(torch.as_tensor(hess_init))
     
     def _ensure_buffers_on_device(self):
         """Ensure buffers are on the same device as parameters"""
         for group in self.param_groups:
+            # Always use float32 for internal optimizer buffers
             if "momentum" in group and group["momentum"].device != self._device:
-                group["momentum"] = group["momentum"].to(device=self._device, dtype=self._dtype)
+                group["momentum"] = group["momentum"].to(device=self._device, dtype=torch.float32)
             if "hess" in group and group["hess"].device != self._device:
-                group["hess"] = group["hess"].to(device=self._device, dtype=self._dtype)
+                group["hess"] = group["hess"].to(device=self._device, dtype=torch.float32)
 
     @contextmanager
     def sampled_params(self, train: bool = False):
@@ -151,7 +161,8 @@ class IVON(torch.optim.Optimizer):
 
                 p_slice = slice(offset, offset + p.numel())
 
-                p.data = param_avg[p_slice].view(p.shape)
+                # Convert param_avg back to parameter's original dtype
+                p.data = param_avg[p_slice].view(p.shape).to(dtype=p.dtype)
                 if train:
                     # Always collect gradient, handling potential accumulated gradients
                     if p.grad is not None:
@@ -181,10 +192,11 @@ class IVON(torch.optim.Optimizer):
             
             # Initialize gradient-related states if not already done
             if self.state.get('avg_grad') is None:
+                # Use gradient dtype for state initialization
                 self.state['avg_grad'] = torch.zeros(
                     total_numel, 
                     device=self._device, 
-                    dtype=self._dtype
+                    dtype=grad_sample.dtype
                 )
                 self.state['avg_nxg'] = torch.zeros_like(self.state['avg_grad'])
                 self.state['avg_gsq'] = torch.zeros_like(self.state['avg_grad'])
@@ -217,6 +229,7 @@ class IVON(torch.optim.Optimizer):
         
         # Initialize gradient-related states if not already done
         if self.state.get('avg_grad') is None:
+            # Initialize with parameter dtype
             self.state['avg_grad'] = torch.zeros(
                 total_numel, 
                 device=self._device, 
@@ -287,7 +300,10 @@ class IVON(torch.optim.Optimizer):
                 p_noise = noise_sample[goffset : goffset + numel]
 
                 param_avgs.append(p_avg)
-                p.data = (p_avg + p_noise).view(p.shape)
+                # Use autocast for parameter sampling arithmetic
+                with torch.autocast(device_type=p.device.type):
+                    sampled_param = (p_avg + p_noise).to(dtype=p.dtype)
+                p.data = sampled_param.view(p.shape)
                 goffset += numel
                 offset += numel
             assert goffset == group["numel"]  # sanity check
@@ -354,9 +370,11 @@ class IVON(torch.optim.Optimizer):
             pg_offset = 0
             for p in group["params"]:
                 if p is not None:
-                    p.data = param_avg[pg_offset : pg_offset + p.numel()].view(
+                    # Convert back to parameter's original dtype
+                    new_param_data = param_avg[pg_offset : pg_offset + p.numel()].view(
                         p.shape
-                    )
+                    ).to(dtype=p.dtype)
+                    p.data = new_param_data
                     pg_offset += p.numel()
             assert pg_offset == group["numel"]  # sanity check
             offset += group["numel"]

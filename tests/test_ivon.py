@@ -285,3 +285,136 @@ def test_ivon_device_move():
         optimizer.step()
     else:
         pytest.skip("CUDA not available")
+
+
+def test_ivon_mixed_precision():
+    """Test IVON optimizer with mixed precision (bfloat16)"""
+    model = SimpleNet()
+
+    # Convert model to bfloat16
+    model = model.to(dtype=torch.bfloat16)
+
+    optimizer = IVON(model.parameters(), lr=0.1, ess=20, mc_samples=1)
+
+    X = torch.randn(10, 10, dtype=torch.bfloat16)
+    y = torch.randint(0, 2, (10,))
+    criterion = torch.nn.CrossEntropyLoss()
+
+    # Store original parameter dtypes
+    original_dtypes = {id(p): p.dtype for p in model.parameters()}
+
+    # Test multiple training steps to ensure dtype consistency
+    for step in range(3):
+        with optimizer.sampled_params(train=True):
+            optimizer.zero_grad()
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            loss.backward()
+
+        # Check gradients after sampled_params processing
+        for param in model.parameters():
+            if param.grad is not None:
+                assert param.grad.dtype == param.dtype, (
+                    f"Step {step}: Gradient dtype {param.grad.dtype} doesn't match parameter dtype {param.dtype}"
+                )
+
+        # Verify parameters still have correct dtype
+        for param in model.parameters():
+            assert param.dtype == original_dtypes[id(param)], (
+                f"Step {step}: Parameter dtype changed from {original_dtypes[id(param)]} to {param.dtype}"
+            )
+
+        # Step the optimizer
+        optimizer.step()
+
+        # Final check after step
+        for param in model.parameters():
+            if param.grad is not None:
+                assert param.grad.dtype == param.dtype, (
+                    f"Step {step} after step(): Gradient dtype {param.grad.dtype} doesn't match parameter dtype {param.dtype}"
+                )
+
+
+def test_ivon_autocast_mixed_precision():
+    """Test IVON optimizer with autocast mixed precision"""
+    model = SimpleNet()
+    optimizer = IVON(model.parameters(), lr=0.1, ess=20, mc_samples=1)
+
+    X = torch.randn(10, 10)
+    y = torch.randint(0, 2, (10,))
+    criterion = torch.nn.CrossEntropyLoss()
+
+    # Store original parameter dtypes
+    original_dtypes = {id(p): p.dtype for p in model.parameters()}
+
+    # Test training with autocast (simulates mixed precision training)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        with optimizer.sampled_params(train=True):
+            optimizer.zero_grad()
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            loss.backward()
+
+    # Check that gradients maintain consistency
+    for param in model.parameters():
+        if param.grad is not None:
+            # Gradients might be in different precision due to autocast
+            assert param.grad.device == param.device, (
+                f"Gradient device {param.grad.device} doesn't match parameter device {param.device}"
+            )
+
+    # Verify parameters still have correct dtype
+    for param in model.parameters():
+        assert param.dtype == original_dtypes[id(param)], (
+            f"Parameter dtype changed from {original_dtypes[id(param)]} to {param.dtype}"
+        )
+
+    # Step the optimizer
+    optimizer.step()
+
+    # Final check - parameters should maintain their original dtype
+    for param in model.parameters():
+        assert param.dtype == original_dtypes[id(param)], (
+            f"After step: Parameter dtype changed from {original_dtypes[id(param)]} to {param.dtype}"
+        )
+
+
+def test_ivon_mixed_precision_consistency():
+    """Test IVON optimizer maintains dtype consistency in mixed precision scenarios"""
+    model = SimpleNet()
+
+    # Start with bfloat16 model
+    model = model.to(dtype=torch.bfloat16)
+
+    optimizer = IVON(model.parameters(), lr=0.1, ess=20, mc_samples=1)
+
+    X = torch.randn(10, 10, dtype=torch.bfloat16)
+    y = torch.randint(0, 2, (10,))
+    criterion = torch.nn.CrossEntropyLoss()
+
+    # Multiple training steps to test consistency
+    for step in range(5):
+        with optimizer.sampled_params(train=True):
+            optimizer.zero_grad()
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            loss.backward()
+
+        # Check gradients and parameters maintain consistency
+        for param in model.parameters():
+            assert param.dtype == torch.bfloat16, (
+                f"Step {step}: Parameter dtype changed to {param.dtype}"
+            )
+            if param.grad is not None:
+                # Note: gradients might be promoted for stability, but parameters should maintain their dtype
+                assert param.device == param.grad.device, (
+                    f"Step {step}: Device mismatch"
+                )
+
+        optimizer.step()
+
+        # After step, parameters should still be bfloat16
+        for param in model.parameters():
+            assert param.dtype == torch.bfloat16, (
+                f"Step {step} after step(): Parameter dtype changed to {param.dtype}"
+            )
