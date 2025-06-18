@@ -226,45 +226,6 @@ class IVON(torch.optim.Optimizer):
                 losses.append(loss)
             loss = sum(losses) / self.mc_samples
         
-        # Collect and accumulate gradients
-        param_grads = []
-        noise_samples = []
-        offset = 0
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p is None or p.grad is None:
-                    continue
-                param_grads.append(p.grad.flatten())
-                # Generate noise for price method
-                if self.hess_approx == 'price':
-                    noise = torch.randn_like(p.grad.flatten())
-                    noise_samples.append(noise)
-                offset += p.numel()
-        
-        # Update gradient running averages if gradients exist
-        if param_grads:
-            grad_sample = torch.cat(param_grads, 0)
-            
-            # Increment count
-            count = self.state["count"] + 1
-            self.state["count"] = count
-            
-            # Update running averages
-            self.state["avg_grad"] = _welford_mean(
-                self.state["avg_grad"], grad_sample, count
-            )
-            
-            # Handle noise for price method
-            if self.hess_approx == 'price' and noise_samples:
-                noise_sample = torch.cat(noise_samples, 0)
-                self.state['avg_nxg'] = _welford_mean(
-                    self.state['avg_nxg'], noise_sample * grad_sample, count
-                )
-            elif self.hess_approx == 'gradsq':
-                self.state['avg_gsq'] = _welford_mean(
-                    self.state['avg_gsq'], grad_sample.square(), count
-                )
-        
         # Handle distributed sync if needed
         if self.sync and dist.is_initialized():
             self._sync_samples()

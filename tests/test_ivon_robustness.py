@@ -125,7 +125,7 @@ def test_ivon_convergence_comparison():
             if optimizer_class == IVON:
                 with optimizer.sampled_params(train=True):
                     loss = closure()
-                    optimizer.step(closure)
+                optimizer.step()
             else:
                 loss = closure()
                 optimizer.step()

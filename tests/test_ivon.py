@@ -66,7 +66,7 @@ def test_ivon_with_accelerate_gradient_accumulation(model_and_data):
     # Store initial parameters and state
     initial_params = [p.clone() for p in model.parameters()]
     
-    base_opt = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    base_opt = optimizer.optimizer
     
     initial_state = {
         'count': base_opt.current_step,
@@ -78,23 +78,20 @@ def test_ivon_with_accelerate_gradient_accumulation(model_and_data):
     # Keep track of parameters
     batch_step_count = 0
     
-    for epoch in range(2):
-        for batch_idx, (batch_x, batch_y) in enumerate(dataloader):
+    for _ in range(2):
+        for _, (batch_x, batch_y) in enumerate(dataloader):
             with accelerator.accumulate(model):
-                # Forward pass
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
-                
-                # Backward pass
-                accelerator.backward(loss)
-                
-                # Explicitly call step with a closure
-                if accelerator.sync_gradients:
-                    def closure():
-                        return loss
+                with optimizer.optimizer.sampled_params(train=True):
+                    # Forward pass
+                    outputs = model(batch_x)
+                    loss = criterion(outputs, batch_y)
                     
-                    # Detailed debugging
-                    optimizer.step(closure)
+                    # Backward pass
+                    accelerator.backward(loss)
+                
+                # Call step when sync_gradients is True
+                if accelerator.sync_gradients:
+                    optimizer.step()
                     batch_step_count += 1
     
     # Check that parameters have been updated
@@ -147,36 +144,33 @@ def test_pytorch_native_gradient_accumulation(model_and_data):
     # Store initial parameters and state
     initial_params = [p.clone() for p in model.parameters()]
     initial_state = {
-        'count': optimizer.state['count'],
-        'avg_grad': optimizer.state['avg_grad'] if optimizer.state.get('avg_grad') is not None else None,
-        'avg_nxg': optimizer.state['avg_nxg'] if optimizer.state.get('avg_nxg') is not None else None,
-        'avg_gsq': optimizer.state['avg_gsq'] if optimizer.state.get('avg_gsq') is not None else None,
+        'count': optimizer.state.get('count', None),
+        'avg_grad': optimizer.state.get('avg_grad', None),
+        'avg_nxg': optimizer.state.get('avg_nxg', None),
+        'avg_gsq': optimizer.state.get('avg_gsq', None),
     }
     
     model.train()
     running_loss = 0.0
     
-    for epoch in range(2):
+    for _ in range(2):
         for i in range(len(X) // 2):
             # Select a subset of data
             batch_x = X[i*2:(i+1)*2]
             batch_y = y[i*2:(i+1)*2]
-            
-            # Forward pass
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y) / accumulation_steps
-            
-            # Backward pass
-            loss.backward()
-            running_loss += loss.item()
-            
+
+            with optimizer.sampled_params(train=True):
+                # Forward pass
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y) / accumulation_steps
+                
+                # Backward pass
+                loss.backward()
+                running_loss += loss.item()
+                
             # Update weights only after accumulation_steps
             if (i + 1) % accumulation_steps == 0:
-                def closure():
-                    return running_loss
-                
-                optimizer.step(closure)
-                
+                optimizer.step()
                 optimizer.zero_grad()
                 running_loss = 0.0
     
@@ -194,7 +188,7 @@ def test_pytorch_native_gradient_accumulation(model_and_data):
     assert optimizer.current_step > initial_state['count'], "Optimizer step count not incremented"
     
     # Check grad-related states have been updated (they start as None, so should not be None now)
-    base_opt = optimizer.optimizer if hasattr(optimizer, 'optimizer') else optimizer
+    base_opt = optimizer
     
     def validate_state(state_name):
         # Get the state value
