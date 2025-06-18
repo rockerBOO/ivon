@@ -287,6 +287,64 @@ def test_ivon_device_move():
         pytest.skip("CUDA not available")
 
 
+def test_ivon_device_state_consistency():
+    """Test that IVON maintains device consistency across state tensors"""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    
+    model = SimpleNet()
+    optimizer = IVON(model.parameters(), lr=0.1, ess=20, mc_samples=1)
+    
+    # Initially everything should be on CPU
+    X_cpu = torch.randn(10, 10)
+    y_cpu = torch.randint(0, 2, (10,))
+    criterion = torch.nn.CrossEntropyLoss()
+    
+    # Train one step on CPU to initialize state
+    with optimizer.sampled_params(train=True):
+        optimizer.zero_grad()
+        outputs = model(X_cpu)
+        loss = criterion(outputs, y_cpu)
+        loss.backward()
+    optimizer.step()
+    
+    # Verify state is initialized on CPU
+    assert optimizer.state['avg_grad'].device.type == 'cpu'
+    assert optimizer.state['avg_nxg'].device.type == 'cpu'
+    
+    # Move model to CUDA
+    model = model.cuda()
+    X_cuda = X_cpu.cuda()
+    y_cuda = y_cpu.cuda()
+    
+    # Train another step on CUDA - this should move state tensors automatically
+    with optimizer.sampled_params(train=True):
+        optimizer.zero_grad()
+        outputs = model(X_cuda)
+        loss = criterion(outputs, y_cuda)
+        loss.backward()
+    optimizer.step()
+    
+    # Verify state tensors are now on CUDA
+    assert optimizer.state['avg_grad'].device.type == 'cuda'
+    assert optimizer.state['avg_nxg'].device.type == 'cuda'
+    
+    # Move back to CPU
+    model = model.cpu()
+    
+    # Train another step on CPU - this should move state tensors back to CPU
+    with optimizer.sampled_params(train=True):
+        optimizer.zero_grad()
+        outputs = model(X_cpu)
+        loss = criterion(outputs, y_cpu)
+        loss.backward()
+    optimizer.step()
+    
+    # Verify state tensors are back on CPU
+    assert optimizer.state['avg_grad'].device.type == 'cpu'
+    assert optimizer.state['avg_nxg'].device.type == 'cpu'
+
+
 def test_ivon_mixed_precision():
     """Test IVON optimizer with mixed precision (bfloat16)"""
     model = SimpleNet()
@@ -418,3 +476,53 @@ def test_ivon_mixed_precision_consistency():
             assert param.dtype == torch.bfloat16, (
                 f"Step {step} after step(): Parameter dtype changed to {param.dtype}"
             )
+
+
+def test_ivon_complex_device_scenario():
+    """Test IVON optimizer with complex device movement scenarios"""
+    model = SimpleNet()
+    
+    # Initialize optimizer on CPU
+    optimizer = IVON(model.parameters(), lr=0.1, ess=20, mc_samples=1)
+    
+    # Move model to CUDA if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        # Move model to CUDA after optimizer initialization
+        model = model.to(device)
+        
+        # Create data on CUDA
+        X = torch.randn(10, 10).to(device)
+        y = torch.randint(0, 2, (10,)).to(device)
+        criterion = torch.nn.CrossEntropyLoss()
+        
+        # Test multiple training steps with device movement
+        for step in range(3):
+            # This should work without device errors
+            with optimizer.sampled_params(train=True):
+                optimizer.zero_grad()
+                outputs = model(X)
+                loss = criterion(outputs, y)
+                loss.backward()
+            
+            optimizer.step()
+            
+            # Verify all parameters are on the same device
+            for param in model.parameters():
+                assert param.device.type == device.type, f"Parameter not on {device.type}"
+        
+        # Test moving model back to CPU
+        model = model.to("cpu")
+        X = X.to("cpu")
+        y = y.to("cpu")
+        
+        # This should also work
+        with optimizer.sampled_params(train=True):
+            optimizer.zero_grad()
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            loss.backward()
+        
+        optimizer.step()
+    else:
+        pytest.skip("CUDA not available")

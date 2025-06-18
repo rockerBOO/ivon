@@ -16,7 +16,9 @@ def _welford_mean(avg: Optional[Tensor], newval: Tensor, count: int) -> Tensor:
         if avg is None:
             return newval
         else:
-            # Ensure consistent dtype
+            # Ensure consistent device and dtype
+            if avg.device != newval.device:
+                avg = avg.to(device=newval.device)
             if avg.dtype != newval.dtype:
                 newval = newval.to(dtype=avg.dtype)
             return avg + (newval - avg) / count
@@ -200,6 +202,12 @@ class IVON(torch.optim.Optimizer):
                 )
                 self.state['avg_nxg'] = torch.zeros_like(self.state['avg_grad'])
                 self.state['avg_gsq'] = torch.zeros_like(self.state['avg_grad'])
+            else:
+                # Ensure existing state tensors are on the correct device
+                if self.state['avg_grad'].device != grad_sample.device:
+                    self.state['avg_grad'] = self.state['avg_grad'].to(device=grad_sample.device)
+                    self.state['avg_nxg'] = self.state['avg_nxg'].to(device=grad_sample.device)
+                    self.state['avg_gsq'] = self.state['avg_gsq'].to(device=grad_sample.device)
             
             # Update running averages
             self.state["avg_grad"] = _welford_mean(
@@ -282,11 +290,12 @@ class IVON(torch.optim.Optimizer):
         offset = 0
         for group in self.param_groups:
             gnumel = group["numel"]
+            
+            # Generate noise on the same device as the hess buffer
+            hess_buffer = group["hess"] + group["weight_decay"]
             noise_sample = (
-                torch.randn(gnumel, device=self._device, dtype=self._dtype)
-                / (
-                    group["ess"] * (group["hess"] + group["weight_decay"])
-                ).sqrt()
+                torch.randn(gnumel, device=hess_buffer.device, dtype=self._dtype)
+                / (group["ess"] * hess_buffer).sqrt()
             )
             noise_samples.append(noise_sample)
 
